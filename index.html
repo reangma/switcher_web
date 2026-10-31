@@ -279,6 +279,7 @@
         <option value="cancel">기기 선택 창에서 취소</option>
       </select>
     </label>
+    <p class="hint" style="margin-top:8px">새로고침 후 자동으로 다시 불러온 기기는 연결이 실패합니다 (실제 Bluefy 동작 재현).</p>
     <div class="mock-switches">
       <span id="mockS1">스위치1: 알 수 없음</span>
       <span id="mockS2">스위치2: 알 수 없음</span>
@@ -352,7 +353,7 @@
       <input type="checkbox" id="invertChk" data-lock><i></i>
     </label>
     <label class="setting toggle">
-      <span><b>연결 유지 모드</b><small>꺼짐(기본): 누를 때마다 연결 → 전송 → 끊기.<br>켜짐: 연결을 유지해 반응이 빠르지만, 그동안 다른 기기는 스위처에 연결할 수 없습니다.</small></span>
+      <span><b>연결 유지 모드</b><small>꺼짐(기본): 누를 때마다 연결 → 전송 → 끊기.<br>켜짐: 연결을 유지해 반응이 빠르고, 끊기면 화면으로 돌아올 때 자동으로 다시 연결합니다. 그동안 다른 기기는 스위처에 연결할 수 없습니다.</small></span>
       <input type="checkbox" id="keepChk" data-lock><i></i>
     </label>
   </section>
@@ -374,6 +375,7 @@
         <li><b>8. 반전 설정</b>설정에서 “ON/OFF 반전”을 켜고 스위치1 켜기/끄기를 다시 눌러, 이번엔 반대로 움직이는지 확인하세요. 확인 후 반전을 다시 끄세요.</li>
         <li><b>9. 결과와 로그 전달</b>“송수신 로그”의 “테스터 메모”에 결과를 짧게 적고, “로그 복사”로 다시 보내주세요.</li>
       </ol>
+      <p>“다시 선택 필요”가 뜨면: 스위치 버튼(또는 “스위처 다시 선택”)을 누르고 SWITCHER_M을 고르면 됩니다. 다른 앱에 오래 있다 오면 Bluefy가 페이지를 새로 여는 경우가 있어서 생기는 정상 동작입니다.</p>
       <p>안 될 때: 페이지 새로고침 → “스위처 찾기”부터 다시. 그래도 안 되면 휴대폰 블루투스를 껐다 켜고, 스위처 배터리를 확인해주세요. (선택) “연결 유지 모드”를 켜고도 한 번 확인해주시면 좋아요.</p>
     </div>
   </details>
@@ -406,7 +408,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.0.0';
+  const APP_VERSION = '1.1.0';
 
   // ===== 통신 규격 =====
   // 근거: io-switcher-local android/flutter_app/lib/main.dart:150-157
@@ -475,13 +477,25 @@
     expectedDisconnect: false,
     disconnectWaiters: [],
     lastCommand: null,
+    restored: false,       // getDevices()로 다시 불러온 기기 (Bluefy에서는 새로고침 후 연결 불가 확인됨)
+    needReselect: false,   // 다시 불러온 기기 연결 실패 → requestDevice로 다시 골라야 함
+    writeFns: null,        // 실제 15BA 특성에서 확인한 쓰기 함수
+    autoTimer: null,
+    autoHistory: [],
   };
 
   const bt = MOCK ? createMockBluetooth() : (navigator.bluetooth || null);
 
   // ===== 로그 =====
+  // 로그는 새로고침 뒤에도 남도록 최근 일부를 localStorage에 저장한다.
   const logs = [];
   const MAX_LOGS = 1000;
+  const STORED_LOGS = 400;
+  let persistTimer = null;
+  function persistLogs() {
+    clearTimeout(persistTimer);
+    storeSet('logs', logs.slice(-STORED_LOGS));
+  }
 
   function timeStamp(d = new Date()) {
     const p = (n, l = 2) => String(n).padStart(l, '0');
@@ -503,6 +517,8 @@
     logs.push(entry);
     if (logs.length > MAX_LOGS) logs.shift();
     console.log('[switcher]', formatEntry(entry));
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(persistLogs, 300);
     renderLog();
   }
   function renderLog() {
@@ -514,6 +530,7 @@
   }
 
   function writeSupportSummary() {
+    if (state.writeFns) return `${state.writeFns} (실제 15BA 특성 기준)`;
     const proto = window.BluetoothRemoteGATTCharacteristic && window.BluetoothRemoteGATTCharacteristic.prototype;
     if (MOCK) return '모의 모드';
     if (!proto) return '확인 불가 (연결 진단에서 확인)';
@@ -586,6 +603,7 @@
     const hasDev = !!state.device;
     let text, tone;
     if (!hasDev) { text = '기기 미선택'; tone = 'idle'; }
+    else if (state.needReselect) { text = '다시 선택 필요'; tone = 'err'; }
     else if (state.conn === 'connecting') { text = '연결 중…'; tone = 'warn'; }
     else if (state.conn === 'connected') { text = '연결됨'; tone = 'ok'; }
     else if (settings.keepAlive) { text = '연결 끊김'; tone = 'err'; }
@@ -595,16 +613,17 @@
     $('deviceName').textContent = hasDev ? (state.device.name || '이름 없는 기기') : '선택된 기기 없음';
 
     const sel = $('selectBtn');
-    const selLabel = hasDev ? '다른 스위처 선택' : '스위처 찾기';
+    const selLabel = state.needReselect ? '스위처 다시 선택' : hasDev ? '다른 스위처 선택' : '스위처 찾기';
     sel.dataset.label = selLabel;
     if (state.busyBtn !== sel) sel.textContent = selLabel;
-    sel.className = hasDev ? 'btn btn-secondary' : 'btn btn-primary';
+    sel.className = (!hasDev || state.needReselect) ? 'btn btn-primary' : 'btn btn-secondary';
 
-    $('reconnectBtn').hidden = !(hasDev && settings.keepAlive && state.conn !== 'connected');
+    $('reconnectBtn').hidden = !(hasDev && !state.needReselect && settings.keepAlive && state.conn !== 'connected');
     $('disconnectBtn').hidden = !(hasDev && settings.keepAlive && state.conn === 'connected');
 
     let hint;
-    if (settings.keepAlive) hint = '연결 유지 모드: 연결을 계속 유지합니다. 끊기면 “다시 연결”을 누르세요.';
+    if (state.needReselect) hint = '페이지가 새로 열려 기기를 다시 골라야 합니다. 스위치 버튼을 누르면 선택 창이 바로 뜨고, 고르면 이어서 전송합니다.';
+    else if (settings.keepAlive) hint = '연결 유지 모드: 연결을 계속 유지하고, 끊기면 자동으로 다시 연결합니다.';
     else if (hasDev) hint = '기본 모드: 버튼을 누를 때마다 연결 → 전송 → 연결 끊기를 합니다. 평소엔 “대기 중”이 정상입니다.';
     else hint = '처음 한 번만 “스위처 찾기”로 기기를 고르면 됩니다.';
     $('modeHint').textContent = hint;
@@ -683,6 +702,8 @@
       text = '이 브라우저가 필요한 블루투스 동작을 지원하지 않습니다. 로그를 전달해주세요.';
     } else if (name === 'InvalidStateError') {
       text = '블루투스 상태가 올바르지 않습니다. 휴대폰 블루투스를 껐다 켠 뒤 페이지를 새로고침해주세요.';
+    } else if (phase === 'connect') {
+      text = '스위처에 연결하지 못했습니다. “다른 스위처 선택”으로 기기를 다시 고른 뒤 시도해주세요.';
     } else {
       text = '알 수 없는 오류가 발생했습니다. 로그를 전달해주세요.';
     }
@@ -705,9 +726,38 @@
     if (expected) {
       log('연결', '연결 종료', { ok: true });
     } else {
-      log('연결', '연결이 끊어졌습니다 (예상하지 못한 끊김)', { ok: false });
-      if (settings.keepAlive && !state.busy) showError('스위처와 연결이 끊겼습니다. “다시 연결”을 눌러주세요.');
+      log('연결', `연결이 끊어졌습니다 (예상하지 못한 끊김${document.hidden ? ', 앱이 백그라운드일 때' : ''})`, { ok: false });
+      if (settings.keepAlive && !state.busy) {
+        if (document.hidden) log('연결', '앱 화면으로 돌아오면 자동으로 다시 연결합니다');
+        else scheduleAutoReconnect('끊김 감지');
+      }
     }
+  }
+
+  // 연결 유지 모드 자동 재연결. 화면에 보일 때만, 1분에 3번까지.
+  function scheduleAutoReconnect(reason, delayMs = 1000) {
+    clearTimeout(state.autoTimer);
+    state.autoTimer = setTimeout(() => {
+      if (!settings.keepAlive || !state.device || state.needReselect || state.busy || document.hidden) return;
+      if (state.conn !== 'disconnected') return;
+      const now = Date.now();
+      state.autoHistory = state.autoHistory.filter((t) => now - t < 60000);
+      if (state.autoHistory.length >= 3) {
+        log('연결', '1분 안에 자동 재연결이 3번을 넘어 멈춥니다', { ok: false });
+        showError('연결이 자꾸 끊깁니다. 스위처 가까이에서 “다시 연결”을 눌러주세요.');
+        return;
+      }
+      state.autoHistory.push(now);
+      log('연결', `자동 재연결 (${reason})`);
+      connectWithRetries($('reconnectBtn'), { auto: true });
+    }, delayMs);
+  }
+
+  function markNeedReselect(err) {
+    state.needReselect = true;
+    log('선택', '다시 불러온 기기로는 연결할 수 없습니다 — 기기를 다시 선택해야 합니다', { ok: false, err });
+    renderConn();
+    showError('페이지가 새로 열려서 스위처를 다시 선택해야 합니다.\n스위치 버튼이나 “스위처 다시 선택”을 누르고 목록에서 SWITCHER_M을 고르면 바로 연결됩니다.');
   }
 
   function attachDevice(dev) {
@@ -719,6 +769,8 @@
     state.device = dev;
     state.server = null;
     state.char = null;
+    state.restored = false;
+    state.needReselect = false;
     if (old !== dev) dev.addEventListener('gattserverdisconnected', onDisconnected);
     storeSet('device', { id: dev.id, name: dev.name || '' });
     setConn(dev.gatt && dev.gatt.connected ? 'connected' : 'disconnected');
@@ -758,6 +810,7 @@
       state.server = server;
       setConn('connected');
       log('연결', '연결됨', { ok: true });
+      if (state.restored) state.restored = false;  // 다시 불러온 기기도 연결되면 정상 기기로 취급
       await sleep(POST_CONNECT_DELAY_MS);
       if (!dev.gatt.connected) throw namedError('NetworkError', '연결 직후 끊어졌습니다');
       return server;
@@ -765,7 +818,10 @@
       try { dev.gatt.disconnect(); } catch (_) {}
       state.server = null;
       setConn('disconnected');
-      throw tag(e, 'connect');
+      const err = tag(e, 'connect');
+      // Bluefy: 새로고침 후 getDevices()로 받은 기기는 즉시 실패(Error: 2). 재시도해도 소용없으니 바로 다시 선택으로.
+      if (state.restored) { try { err.staleRestore = true; err.fatal = true; } catch (_) {} }
+      throw err;
     }
   }
 
@@ -787,8 +843,14 @@
       ch = await withTimeout(svc.getCharacteristic(CHAR_UUID), GATT_TIMEOUT_MS, '특성 탐색');
     } catch (e) { throw tag(e, 'char'); }  // 15BA가 없으면 다른 특성으로 대체하지 않는다
     log('탐색', `특성 15BA 찾음 (속성: ${propsText(ch.properties)})`, { ok: true });
+    recordWriteFns(ch);
     state.char = ch;
     return ch;
+  }
+
+  function recordWriteFns(ch) {
+    if (state.writeFns) return;
+    state.writeFns = WRITE_METHODS.map((m) => `${m} ${typeof ch[m] === 'function' ? 'O' : 'X'}`).join(', ');
   }
 
   // writeValueWithResponse → writeValueWithoutResponse → writeValue 순서로,
@@ -842,9 +904,9 @@
     if (settings.keepAlive) await connectWithRetries($('reconnectBtn'));
   }
 
-  async function connectWithRetries(btn) {
-    if (state.busy || !state.device) return;
-    hideError();
+  async function connectWithRetries(btn, opts = {}) {
+    if (state.busy || !state.device || state.needReselect) return;
+    if (!opts.auto) hideError();
     setBusy(true, btn);
     let lastErr = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -857,21 +919,30 @@
         lastErr = e;
         log('연결', `${attempt}/${MAX_ATTEMPTS}회차 실패`, { ok: false, err: e });
         await disconnectAndWait();
+        if (e.fatal) break;
         if (attempt < MAX_ATTEMPTS) await sleep(RETRY_DELAY_MS);
       }
     }
     setBusy(false);
-    if (lastErr) showError(friendlyError(lastErr));
-    else log('연결', '연결 유지 중', { ok: true });
+    if (lastErr) {
+      if (lastErr.staleRestore) markNeedReselect(lastErr);
+      else showError(friendlyError(lastErr));
+    } else {
+      hideError();
+      log('연결', '연결 유지 중', { ok: true });
+    }
   }
 
   async function sendCommand(sw, requested, btn) {
     if (state.busy) return;
     hideError();
     if (!bt) { showUnsupportedError(); return; }
-    if (!state.device) {
-      showError('먼저 위의 “스위처 찾기”를 눌러 기기를 선택해주세요.');
-      return;
+    if (!state.device || state.needReselect) {
+      // 버튼 클릭 직후라 선택 창을 바로 열 수 있다. 고르면 이어서 전송.
+      log('명령', '기기 선택이 필요해 선택 창을 엽니다');
+      await selectDevice();
+      if (!state.device || state.needReselect || state.busy) return;
+      if (settings.keepAlive && state.conn !== 'connected') return;  // 연결 실패 안내는 selectDevice가 이미 표시
     }
     if (sw === 2 && settings.gang !== 2) return;
 
@@ -909,7 +980,8 @@
     const time = timeStamp().slice(0, 8);
     if (lastErr) {
       log('결과', `${desc} 실패`, { ok: false, byte, err: lastErr });
-      showError(friendlyError(lastErr));
+      if (lastErr.staleRestore) markNeedReselect(lastErr);
+      else showError(friendlyError(lastErr));
       showResult(false, `✘ ${desc} 실패 (${time})`);
     } else {
       log('결과', `${desc} 전송 성공 (${method})`, { ok: true, byte });
@@ -962,6 +1034,7 @@
         log('진단', `15BA 속성: ${propsText(p)}`, { ok: true });
         log('진단', `15BA 쓰기 가능: ${canWrite ? '예' : '아니요'} (write=${!!p.write}, writeWithoutResponse=${!!p.writeWithoutResponse})`, { ok: canWrite });
         log('진단', '브라우저 쓰기 함수: ' + WRITE_METHODS.map((m) => `${m} ${typeof ch[m] === 'function' ? '있음' : '없음'}`).join(', '));
+        recordWriteFns(ch);
         if (!canWrite) problem = namedError('NotSupportedError', '15BA 특성이 쓰기를 지원하지 않는다고 보고됨');
         else if (settings.keepAlive) state.char = ch;
       } catch (e) {
@@ -976,7 +1049,8 @@
     setBusy(false);
     log('진단', problem ? '완료 — 문제 있음' : '완료 — 이상 없음 (명령은 보내지 않았습니다)', { ok: !problem });
     if (problem) {
-      showError(friendlyError(problem));
+      if (problem.staleRestore) markNeedReselect(problem);
+      else showError(friendlyError(problem));
       showResult(false, '✘ 연결 진단에서 문제가 발견됐습니다. 로그를 복사해 전달해주세요.');
     } else {
       showResult(true, '✔ 연결 진단 완료. 아래 “로그 복사”로 결과를 전달해주세요.');
@@ -984,7 +1058,7 @@
   }
 
   async function tryRestoreDevice() {
-    if (MOCK || !bt || typeof bt.getDevices !== 'function') return;
+    if (!bt || typeof bt.getDevices !== 'function') return;
     const saved = storeGet('device', null);
     if (!saved || !saved.id) return;
     try {
@@ -992,7 +1066,9 @@
       const dev = devices.find((d) => d.id === saved.id);
       if (dev) {
         attachDevice(dev);
+        state.restored = true;
         log('선택', `이전에 고른 기기를 다시 불러왔습니다: ${dev.name || '(이름 없음)'}`, { ok: true });
+        if (settings.keepAlive) scheduleAutoReconnect('페이지 열림', 300);
       } else {
         log('선택', '이전 기기를 자동으로 불러오지 못했습니다 — “스위처 찾기”를 눌러주세요');
       }
@@ -1008,6 +1084,7 @@
     const err = (name, message) => namedError(name, message);
     let flakyCount = 0;
     let dropTimer = null;
+    let fromGetDevices = false;  // Bluefy 재현: 새로고침 후 getDevices()로 받은 기기는 연결 즉시 실패
     const switches = { 1: null, 2: null };
     const listeners = new Set();
     const BYTE_EFFECT = { 0x00: [1, true], 0x01: [1, false], 0x05: [2, true], 0x03: [2, false] };
@@ -1079,6 +1156,7 @@
       device,
       connected: false,
       async connect() {
+        if (fromGetDevices) { await wait(20); throw err('Error', '2'); }
         await wait(600);
         const sc = scenario();
         if (sc === 'hang') return new Promise(() => {});
@@ -1115,7 +1193,12 @@
         if (!options || !options.optionalServices || !options.optionalServices.includes(SERVICE_UUID)) {
           throw err('SecurityError', '(모의) optionalServices에 150B가 없습니다');
         }
+        fromGetDevices = false;
         return device;
+      },
+      async getDevices() {
+        fromGetDevices = true;
+        return [device];
       },
       async getAvailability() { return true; },
     };
@@ -1219,6 +1302,7 @@
   }
   $('clearLogBtn').addEventListener('click', () => {
     logs.length = 0;
+    persistLogs();
     $('copyMsg').hidden = true;
     $('copyFallback').hidden = true;
     log('로그', '로그를 지웠습니다');
@@ -1232,6 +1316,25 @@
   memo.value = storeGet('memo', '') || '';
   memo.addEventListener('input', () => storeSet('memo', memo.value));
 
+  // 앱 화면 이탈/복귀: 백그라운드에서 끊긴 시점을 로그로 남기고, 돌아오면 자동 재연결
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      log('화면', '앱 화면을 벗어남 (백그라운드)');
+      persistLogs();  // 백그라운드에서 페이지가 정지·종료될 수 있으므로 바로 저장
+      return;
+    }
+    const linked = !!(state.device && state.device.gatt && state.device.gatt.connected);
+    log('화면', `앱 화면으로 돌아옴 (블루투스 연결: ${linked ? '유지됨' : '끊김'})`);
+    if (!linked && state.conn === 'connected') {
+      // 정지된 동안 끊김 이벤트를 못 받았을 수 있다
+      state.server = null;
+      state.char = null;
+      setConn('disconnected');
+    }
+    scheduleAutoReconnect('화면 복귀', 300);
+  });
+  window.addEventListener('pagehide', persistLogs);
+
   // ===== 시작 =====
   $('versionText').textContent = `v${APP_VERSION}`;
   $('mockBadge').hidden = !MOCK;
@@ -1240,7 +1343,12 @@
   renderSettings();
   renderConn();
 
-  log('시작', `I/O 스위처 웹 v${APP_VERSION}${MOCK ? ' (모의 모드 — 실제 블루투스 사용 안 함)' : ''}`);
+  const previousLogs = storeGet('logs', []);
+  if (Array.isArray(previousLogs) && previousLogs.length) {
+    logs.push(...previousLogs.filter((e) => e && typeof e.msg === 'string'));
+    log('────', '──── 여기부터 새로 열린 페이지 (위는 이전 기록) ────');
+  }
+  log('시작', `I/O 스위처 웹 v${APP_VERSION}${MOCK ? ' (모의 모드 — 실제 블루투스 사용 안 함)' : ''} — ${new Date().toLocaleString('ko-KR')}`);
   log('환경', `userAgent: ${navigator.userAgent}`);
   log('환경', `Web Bluetooth: ${MOCK ? '모의' : (navigator.bluetooth ? '지원' : '미지원')}, HTTPS: ${window.isSecureContext ? '예' : '아니요'}, 쓰기 함수: ${writeSupportSummary()}`);
   log('환경', `설정: ${settings.gang}구, 반전 ${settings.invert ? '켜짐' : '꺼짐'}, 연결 유지 ${settings.keepAlive ? '켜짐' : '꺼짐'}`);
