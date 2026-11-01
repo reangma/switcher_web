@@ -375,7 +375,7 @@
         <li><b>8. 반전 설정</b>설정에서 “ON/OFF 반전”을 켜고 스위치1 켜기/끄기를 다시 눌러, 이번엔 반대로 움직이는지 확인하세요. 확인 후 반전을 다시 끄세요.</li>
         <li><b>9. 결과와 로그 전달</b>“송수신 로그”의 “테스터 메모”에 결과를 짧게 적고, “로그 복사”로 다시 보내주세요.</li>
       </ol>
-      <p>“다시 선택 필요”가 뜨면: 스위치 버튼(또는 “스위처 다시 선택”)을 누르고 SWITCHER_M을 고르면 됩니다. 다른 앱에 오래 있다 오면 Bluefy가 페이지를 새로 여는 경우가 있어서 생기는 정상 동작입니다.</p>
+      <p>다른 앱에 오래 있다 오면 Bluefy가 페이지를 새로 여는데, 이때 “이전 기기 연결 중…”이 잠깐 뜨고 자동으로 다시 연결됩니다. 혹시 “다시 선택 필요”가 뜨면 스위치 버튼(또는 “스위처 다시 선택”)을 누르고 SWITCHER_M을 고르면 됩니다.</p>
       <p>안 될 때: 페이지 새로고침 → “스위처 찾기”부터 다시. 그래도 안 되면 휴대폰 블루투스를 껐다 켜고, 스위처 배터리를 확인해주세요. (선택) “연결 유지 모드”를 켜고도 한 번 확인해주시면 좋아요.</p>
     </div>
   </details>
@@ -408,7 +408,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '1.2.0';
+  const APP_VERSION = '1.2.1';
 
   // ===== 통신 규격 =====
   // 근거: io-switcher-local android/flutter_app/lib/main.dart:150-157
@@ -534,7 +534,7 @@
     if (state.writeFns) return `${state.writeFns} (실제 15BA 특성 기준)`;
     const proto = window.BluetoothRemoteGATTCharacteristic && window.BluetoothRemoteGATTCharacteristic.prototype;
     if (MOCK) return '모의 모드';
-    if (!proto) return '확인 불가 (연결 진단에서 확인)';
+    if (!proto) return '첫 연결 후 확인';
     return WRITE_METHODS.map((m) => `${m} ${typeof proto[m] === 'function' ? 'O' : 'X'}`).join(', ');
   }
   function buildReport() {
@@ -1451,7 +1451,8 @@
       return;
     }
     const linked = !!(state.device && state.device.gatt && state.device.gatt.connected);
-    log('화면', `앱 화면으로 돌아옴 (블루투스 연결: ${linked ? '유지됨' : '끊김'})`);
+    const linkText = linked ? '유지됨' : settings.keepAlive ? '끊김' : '없음 — 기본 모드는 누를 때만 연결하므로 정상';
+    log('화면', `앱 화면으로 돌아옴 (블루투스 연결: ${linkText})`);
     if (!linked && state.conn === 'connected') {
       // 정지된 동안 끊김 이벤트를 못 받았을 수 있다
       state.server = null;
